@@ -52,7 +52,7 @@ class Settings:
     @classmethod
     def update_last_taken_id(cls, new_value: int):
         data_path = os.path.join(cls.BASE_DIR, "cache.csv")
-        with open(data_path, mode="r") as file:
+        with open(data_path, mode="w") as file:
             file.write(f"last_taken_id,{new_value}")
 
 
@@ -66,6 +66,7 @@ class Tweet:
     retweet_count: int
     trend: str
     normalized_trend: str
+    author: str
     language_code: str
     hashtags: List[str]
     tagged_persons: List[str]
@@ -124,8 +125,12 @@ class ORM:
     @classmethod
     def _exec_write_tweets_to_neo4j(cls, tx: Transaction, tweets: List[Tweet]):
         insert_tweet_queries = []
+        insert_author_queries = []
+        insert_author_relation_queries = []
         insert_hashtag_queries = []
         insert_relation_queries = []
+        insert_linked_users_queries = []
+        insert_linked_users_relation_queries = []
 
         for tweet_index, tweet in enumerate(tweets):
             insert_tweet_queries.append(
@@ -149,6 +154,20 @@ class ORM:
                 )
             )
 
+            insert_author_queries.append(
+                "MERGE (u%i:User {name: '%s'})" % (
+                    tweet_index,
+                    tweet.author
+                )
+            )
+
+            insert_author_relation_queries.append(
+                "CREATE (u%i)<-[:WRITTEN_BY]-(t%i)" % (
+                    tweet_index,
+                    tweet_index
+                )
+            )
+
             for hashtag_index, hashtag in enumerate(tweet.hashtags):
                 insert_hashtag_queries.append(
                     "MERGE (h%i_%i:Hashtag {hashtag: '%s'})" % (
@@ -158,17 +177,37 @@ class ORM:
                     )
                 )
                 insert_relation_queries.append(
-                    "MERGE (t%i) <- [:IS_IN] - (h%i_%i)" % (
+                    "CREATE (t%i) <- [:IS_IN] - (h%i_%i)" % (
                         tweet_index,
                         tweet_index,
                         hashtag_index
                     )
                 )
 
+            for user_index, user in enumerate(tweet.tagged_persons):
+                insert_hashtag_queries.append(
+                    "MERGE (u%i_%i:User {name: '%s'})" % (
+                        tweet_index,
+                        user_index,
+                        user
+                    )
+                )
+                insert_relation_queries.append(
+                    "CREATE (t%i) <- [:IS_LINKED_IN] - (u%i_%i)" % (
+                        tweet_index,
+                        tweet_index,
+                        user_index
+                    )
+                )
+
         full_query_string = f"""
             {" ".join(insert_tweet_queries)}
+            {" ".join(insert_author_queries)}
+            {" ".join(insert_author_relation_queries)}
             {" ".join(insert_hashtag_queries)}
             {" ".join(insert_relation_queries)}
+            {" ".join(insert_linked_users_queries)}
+            {" ".join(insert_linked_users_relation_queries)}
         """
 
         tx.run(full_query_string)
