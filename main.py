@@ -278,6 +278,7 @@ def event_listener():
     while True:
         msg = consumer.poll(timeout=1)
         if msg is None:
+            logger.info("No Message Received. Wait for polling.")
             continue
         elif msg.error():
             logger.error(msg.error())
