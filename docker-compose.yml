@@ -1,0 +1,13 @@
+version: "3"
+
+services:
+  pg-neo4j-sync:
+    build: .
+    container_name: pg-neo4j-sync
+    env_file:
+      - .env
+    command:
+      - sh
+      - -c
+      - |
+        python main.py
