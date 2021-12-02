@@ -2,6 +2,7 @@ import os
 import psycopg2
 import sys
 import logging
+import uuid
 from time import sleep
 from neo4j import GraphDatabase
 from typing import List, Optional, Callable
@@ -47,7 +48,7 @@ class Settings:
     def get_kafka_consumer_kwargs() -> dict:
         return {
             "bootstrap.servers": os.getenv("KAFKA_CLUSTER_SERVER"),
-            "group.id": 'grp1',
+            "group.id": uuid.uuid4().hex[:6],
             'auto.offset.reset': 'earliest',
             'security.protocol': 'SASL_SSL',
             'sasl.mechanisms': 'PLAIN',
