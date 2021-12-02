@@ -9,6 +9,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from neo4j.work.transaction import Transaction
+from neo4j.exceptions import ConstraintError
 from confluent_kafka import Consumer
 
 load_dotenv()
@@ -186,32 +187,18 @@ class ORM:
         return users
 
     @classmethod
-    def write_hashtags_to_neo4j(cls, tx: Transaction, hashtags: List[Hashtag]):
-        if len(hashtags) == 0:
-            return
-        logger.info(f"Start writing {len(hashtags)} to Neo4J")
-        hashtag_nodes = [
-            "MERGE (h%i:Hashtag {hashtag: '%s'})" % (i, hashtag.hashtag)
-            for i, hashtag in enumerate(hashtags)
-        ]
-        for i, query in hashtag_nodes:
-            logger.info(f"User {i + 1} / {len(hashtag_nodes)}")
-            tx.run(query)
-            ORM.update_index_in_pg(key="last_taken_hashtag_id", index=hashtags[i].id)
+    def write_hashtags_to_neo4j(cls, tx: Transaction, hashtag: Hashtag):
+        try:
+            tx.run("CREATE (h:Hashtag {hashtag: '%s'})" % hashtag.hashtag)
+        except ConstraintError:
+            logger.warning(f"Hashtag w. tag {hashtag.hashtag} already exists")
 
     @classmethod
-    def write_users_to_neo4j(cls, tx: Transaction, users: List[TwitterUser]):
-        if len(users) == 0:
-            return
-        logger.info(f"Start writing {len(users)} to Neo4J")
-        user_nodes = [
-            "MERGE (u%i:User {username: '%s'})" % (i, user.username)
-            for i, user in enumerate(users)
-        ]
-        for i, query in enumerate(user_nodes):
-            logger.info(f"User {i + 1} / {len(user_nodes)}")
-            tx.run(query)
-            ORM.update_index_in_pg(key="last_taken_twitter_user_id", index=users[i].id)
+    def write_users_to_neo4j(cls, tx: Transaction, user: TwitterUser):
+        try:
+            tx.run("CREATE (u:User {username: '%s'})" % user.username)
+        except ConstraintError:
+            logger.warning(f"User w. username {user.username} already exists")
 
     @classmethod
     def write_tweet_to_neo4j(cls, tx: Transaction, tweet: Tweet):
@@ -265,14 +252,19 @@ class ORM:
 
 def runner():
     logger.info("Start Runner")
+
     users = ORM.fetch_latest_users()
-    Neo4J.exec(ORM.write_users_to_neo4j, users=users)
-    max_user_id = max(user.id for user in users)
-    ORM.update_index_in_pg(key="last_taken_twitter_user_id", index=max_user_id)
+    for i, user in enumerate(users):
+        logger.info(f"Write User {i + 1} / {len(users)} w. usernamme {user.username} to Neo4J")
+        Neo4J.exec(ORM.write_users_to_neo4j, user=user)
+        ORM.update_index_in_pg(key="last_taken_twitter_user_id", index=user.id)
+
     hashtags = ORM.fetch_latest_hashtags()
-    Neo4J.exec(ORM.write_hashtags_to_neo4j, hashtags=hashtags)
-    max_hashtag_id = max(hashtag.id for hashtag in hashtags)
-    ORM.update_index_in_pg(key="last_taken_hashtag_id", index=max_hashtag_id)
+    for i, hashtag in enumerate(hashtags):
+        logger.info(f"Write Hashtag {i + 1} / {len(hashtags)} w. tag {hashtag.hashtag} to Neo4J")
+        Neo4J.exec(ORM.write_hashtags_to_neo4j, hashtag=hashtag)
+        ORM.update_index_in_pg(key="last_taken_hashtag_id", index=hashtag.id)
+
     tweets = ORM.fetch_latest_tweets_ordered_by_id()
     for tweet in tweets:
         Neo4J.exec(ORM.write_tweet_to_neo4j, tweet=tweet)
