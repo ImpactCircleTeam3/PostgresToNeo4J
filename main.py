@@ -1,15 +1,15 @@
-# Current Index 5490
-
 import os
 import psycopg2
 import sys
 import logging
+from time import sleep
 from neo4j import GraphDatabase
 from typing import List, Optional, Callable
 from datetime import datetime
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from neo4j.work.transaction import Transaction
+from confluent_kafka import Consumer
 
 load_dotenv()
 
@@ -40,6 +40,18 @@ class Settings:
             "user": os.getenv("NEO4J_USER"),
             "password": os.getenv("NEO4J_PASSWORD"),
             "uri": os.getenv("NEO4J_URI")
+        }
+
+    @staticmethod
+    def get_kafka_consumer_kwargs() -> dict:
+        return {
+            "bootstrap.servers": os.getenv("KAFKA_CLUSTER_SERVER"),
+            "group.id": 'grp1',
+            'auto.offset.reset': 'earliest',
+            'security.protocol': 'SASL_SSL',
+            'sasl.mechanisms': 'PLAIN',
+            'sasl.username': os.getenv("KAFKA_CLUSTER_API_KEY"),
+            'sasl.password': os.getenv("KAFKA_CLUSTER_API_SECRET")
         }
 
 
@@ -117,6 +129,21 @@ class Neo4J:
             session.write_transaction(executable, **kwargs)
 
 
+class KafkaConnector:
+    kafka_connector: Optional["KafkaConnector"] = None
+
+    @classmethod
+    def get_instance(cls) -> "KafkaConnector":
+        if not cls.kafka_connector:
+            cls.kafka_connector = cls()
+        return cls.kafka_connector
+
+    def __init__(self):
+        self.consumer = Consumer(
+            Settings.get_kafka_consumer_kwargs()
+        )
+
+
 class ORM:
     pg_db = Postgres.get_instance().Postgres
 
@@ -142,7 +169,7 @@ class ORM:
     def fetch_latest_hashtags(cls) -> List[Hashtag]:
         latest_hashtag_id = cls.get_index_from_pg(key="last_taken_hashtag_id")
         logger.info(f"Start Fetching latest hashtags. Latest index: {latest_hashtag_id}")
-        sql = f"SELECT {','.join(Hashtag.__annotations__.keys())} FROM hashtag WHERE id > %s"
+        sql = f"SELECT {','.join(Hashtag.__annotations__.keys())} FROM hashtag WHERE id > %s ORDER BY id"
         cls.pg_db.cur.execute(sql, (latest_hashtag_id,))
         hashtags = [Hashtag(*row) for row in cls.pg_db.cur.fetchall()]
         logger.info(f"Fetched hashtags: {len(hashtags)}")
@@ -152,7 +179,7 @@ class ORM:
     def fetch_latest_users(cls) -> List[TwitterUser]:
         latest_user_id = cls.get_index_from_pg(key="last_taken_twitter_user_id")
         logger.info(f"Start Fetching latest users. Latest index: {latest_user_id}")
-        sql = f"SELECT {','.join(TwitterUser.__annotations__.keys())} FROM twitter_user WHERE id > %s"
+        sql = f"SELECT {','.join(TwitterUser.__annotations__.keys())} FROM twitter_user WHERE id > %s ORDER BY id"
         cls.pg_db.cur.execute(sql, (latest_user_id,))
         users = [TwitterUser(*row) for row in cls.pg_db.cur.fetchall()]
         logger.info(f"Fetched Users: {len(users)}")
@@ -167,8 +194,10 @@ class ORM:
             "MERGE (h%i:Hashtag {hashtag: '%s'})" % (i, hashtag.hashtag)
             for i, hashtag in enumerate(hashtags)
         ]
-        for query in hashtag_nodes:
+        for i, query in hashtag_nodes:
+            logger.info(f"User {i + 1} / {len(hashtag_nodes)}")
             tx.run(query)
+            ORM.update_index_in_pg(key="last_taken_hashtag_id", index=hashtags[i].id)
 
     @classmethod
     def write_users_to_neo4j(cls, tx: Transaction, users: List[TwitterUser]):
@@ -179,8 +208,10 @@ class ORM:
             "MERGE (u%i:User {username: '%s'})" % (i, user.username)
             for i, user in enumerate(users)
         ]
-        for query in user_nodes:
+        for i, query in enumerate(user_nodes):
+            logger.info(f"User {i + 1} / {len(user_nodes)}")
             tx.run(query)
+            ORM.update_index_in_pg(key="last_taken_twitter_user_id", index=users[i].id)
 
     @classmethod
     def write_tweet_to_neo4j(cls, tx: Transaction, tweet: Tweet):
@@ -249,6 +280,24 @@ def runner():
     logger.info("Done.")
 
 
+def event_listener():
+    consumer = KafkaConnector.get_instance().kafka_connector.consumer
+    consumer.subscribe(["sync"])
+    while True:
+        msg = consumer.poll(timeout=1)
+        if msg is None:
+            continue
+        elif msg.error():
+            logger.error(msg.error())
+        else:
+            runner()
+
+
 if __name__ == "__main__":
-    runner()
-    print()
+    while True:
+        try:
+            event_listener()
+        except Exception as e:
+            logger.exception(str(e))
+        logger.info("Wait for reconnection")
+        sleep(60)
