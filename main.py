@@ -1,10 +1,11 @@
+# Current Index 5490
+
 import os
 import psycopg2
-import csv
 import sys
 import logging
 from neo4j import GraphDatabase
-from typing import List, Optional
+from typing import List, Optional, Callable
 from datetime import datetime
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -41,20 +42,6 @@ class Settings:
             "uri": os.getenv("NEO4J_URI")
         }
 
-    @classmethod
-    def get_last_taken_id(cls) -> int:
-        data_path = os.path.join(cls.BASE_DIR, "cache.csv")
-        with open(data_path, mode="r") as csv_file:
-            reader = csv.reader(csv_file)
-            last_taken_id = int(next(reader)[1])
-        return last_taken_id
-
-    @classmethod
-    def update_last_taken_id(cls, new_value: int):
-        data_path = os.path.join(cls.BASE_DIR, "cache.csv")
-        with open(data_path, mode="w") as file:
-            file.write(f"last_taken_id,{new_value}")
-
 
 @dataclass
 class Tweet:
@@ -74,6 +61,18 @@ class Tweet:
     date_label: datetime
 
 
+@dataclass
+class Hashtag:
+    id: int
+    hashtag: str
+
+
+@dataclass
+class TwitterUser:
+    id: int
+    username: str
+
+
 class Postgres:
     Postgres: Optional["Postgres"] = None
 
@@ -88,6 +87,7 @@ class Postgres:
 
     def _connect(self):
         self.conn = psycopg2.connect(**Settings.get_db_kwargs())
+        self.conn.autocommit = True
         self.cur = self.conn.cursor()
 
 
@@ -110,125 +110,145 @@ class Neo4J:
             auth=(neo4j_kwargs["user"], neo4j_kwargs["password"])
         )
 
+    @classmethod
+    def exec(cls, executable: Callable, **kwargs):
+        neo4j = cls.get_instance().Neo4J
+        with neo4j.driver.session() as session:
+            session.write_transaction(executable, **kwargs)
+
 
 class ORM:
     pg_db = Postgres.get_instance().Postgres
-    neo4j = Neo4J.get_instance().Neo4J
 
     @classmethod
-    def fetch_latest_tweets(cls) -> List[Tweet]:
-        latest_id = Settings.get_last_taken_id()
-        sql = f"SELECT {','.join(Tweet.__annotations__.keys())} FROM tweet WHERE id > %s"
+    def get_index_from_pg(cls, key: str) -> int:
+        sql = "SELECT value FROM postgres_to_neo_cache WHERE key=%s"
+        cls.pg_db.cur.execute(sql, (key,))
+        return cls.pg_db.cur.fetchone()[0]
+
+    @classmethod
+    def update_index_in_pg(cls, key: str, index: int):
+        sql = "UPDATE postgres_to_neo_cache SET value=%s WHERE key=%s"
+        cls.pg_db.cur.execute(sql, (index, key,))
+
+    @classmethod
+    def fetch_latest_tweets_ordered_by_id(cls) -> List[Tweet]:
+        latest_id = cls.get_index_from_pg(key="last_taken_id")
+        sql = f"SELECT {','.join(Tweet.__annotations__.keys())} FROM tweet WHERE id > %s ORDER BY id"
         cls.pg_db.cur.execute(sql, (latest_id,))
         return [Tweet(*row) for row in cls.pg_db.cur.fetchall()]
 
     @classmethod
-    def _exec_write_tweets_to_neo4j(cls, tx: Transaction, tweets: List[Tweet]):
-        insert_tweet_queries = []
-        insert_author_queries = []
-        insert_author_relation_queries = []
-        insert_hashtag_queries = []
-        insert_relation_queries = []
-        insert_linked_users_queries = []
-        insert_linked_users_relation_queries = []
-
-        for tweet_index, tweet in enumerate(tweets):
-            insert_tweet_queries.append(
-                """
-                    MERGE (
-                        t%i:Tweet {
-                            id: %i,
-                            text: '%s',
-                            date: '%s',
-                            favorite_count: %i,
-                            retweet_count: %i
-                        }
-                    )
-                """ % (
-                    tweet_index,
-                    tweet.status_id,
-                    tweet.text.replace("'", " "),
-                    tweet.date_label.strftime("%Y-%m-%d"),
-                    tweet.favorite_count,
-                    tweet.retweet_count
-                )
-            )
-
-            insert_author_queries.append(
-                "MERGE (u%i:User {name: '%s'})" % (
-                    tweet_index,
-                    tweet.author
-                )
-            )
-
-            insert_author_relation_queries.append(
-                "CREATE (u%i)<-[:WRITTEN_BY]-(t%i)" % (
-                    tweet_index,
-                    tweet_index
-                )
-            )
-
-            for hashtag_index, hashtag in enumerate(tweet.hashtags):
-                insert_hashtag_queries.append(
-                    "MERGE (h%i_%i:Hashtag {hashtag: '%s'})" % (
-                        tweet_index,
-                        hashtag_index,
-                        hashtag
-                    )
-                )
-                insert_relation_queries.append(
-                    "CREATE (t%i) <- [:IS_IN] - (h%i_%i)" % (
-                        tweet_index,
-                        tweet_index,
-                        hashtag_index
-                    )
-                )
-
-            for user_index, user in enumerate(tweet.tagged_persons):
-                insert_hashtag_queries.append(
-                    "MERGE (u%i_%i:User {name: '%s'})" % (
-                        tweet_index,
-                        user_index,
-                        user
-                    )
-                )
-                insert_relation_queries.append(
-                    "CREATE (t%i) <- [:IS_LINKED_IN] - (u%i_%i)" % (
-                        tweet_index,
-                        tweet_index,
-                        user_index
-                    )
-                )
-
-        full_query_string = f"""
-            {" ".join(insert_tweet_queries)}
-            {" ".join(insert_author_queries)}
-            {" ".join(insert_author_relation_queries)}
-            {" ".join(insert_hashtag_queries)}
-            {" ".join(insert_relation_queries)}
-            {" ".join(insert_linked_users_queries)}
-            {" ".join(insert_linked_users_relation_queries)}
-        """
-
-        tx.run(full_query_string)
+    def fetch_latest_hashtags(cls) -> List[Hashtag]:
+        latest_hashtag_id = cls.get_index_from_pg(key="last_taken_hashtag_id")
+        logger.info(f"Start Fetching latest hashtags. Latest index: {latest_hashtag_id}")
+        sql = f"SELECT {','.join(Hashtag.__annotations__.keys())} FROM hashtag WHERE id > %s"
+        cls.pg_db.cur.execute(sql, (latest_hashtag_id,))
+        hashtags = [Hashtag(*row) for row in cls.pg_db.cur.fetchall()]
+        logger.info(f"Fetched hashtags: {len(hashtags)}")
+        return hashtags
 
     @classmethod
-    def write_tweets_to_neo4j(cls, tweets: List[Tweet]):
-        with cls.neo4j.driver.session() as session:
-            session.write_transaction(cls._exec_write_tweets_to_neo4j, tweets)
+    def fetch_latest_users(cls) -> List[TwitterUser]:
+        latest_user_id = cls.get_index_from_pg(key="last_taken_twitter_user_id")
+        logger.info(f"Start Fetching latest users. Latest index: {latest_user_id}")
+        sql = f"SELECT {','.join(TwitterUser.__annotations__.keys())} FROM twitter_user WHERE id > %s"
+        cls.pg_db.cur.execute(sql, (latest_user_id,))
+        users = [TwitterUser(*row) for row in cls.pg_db.cur.fetchall()]
+        logger.info(f"Fetched Users: {len(users)}")
+        return users
+
+    @classmethod
+    def write_hashtags_to_neo4j(cls, tx: Transaction, hashtags: List[Hashtag]):
+        if len(hashtags) == 0:
+            return
+        logger.info(f"Start writing {len(hashtags)} to Neo4J")
+        hashtag_nodes = [
+            "MERGE (h%i:Hashtag {hashtag: '%s'})" % (i, hashtag.hashtag)
+            for i, hashtag in enumerate(hashtags)
+        ]
+        for query in hashtag_nodes:
+            tx.run(query)
+
+    @classmethod
+    def write_users_to_neo4j(cls, tx: Transaction, users: List[TwitterUser]):
+        if len(users) == 0:
+            return
+        logger.info(f"Start writing {len(users)} to Neo4J")
+        user_nodes = [
+            "MERGE (u%i:User {username: '%s'})" % (i, user.username)
+            for i, user in enumerate(users)
+        ]
+        for query in user_nodes:
+            tx.run(query)
+
+    @classmethod
+    def write_tweet_to_neo4j(cls, tx: Transaction, tweet: Tweet):
+        logger.info(f"Start writing Tweet w. id {tweet.status_id} to Neo4J")
+        create_tweet_query = """
+                CREATE (t:Tweet {
+                    id: %i,
+                    text: '%s',
+                    date: '%s',
+                    favorite_count: %i,
+                    retweet_count: %i
+                })
+            """ % (
+            tweet.status_id,
+            tweet.text.replace("'", " "),
+            tweet.date_label.strftime("%Y-%m-%d"),
+            tweet.favorite_count,
+            tweet.retweet_count
+        )
+        tx.run(create_tweet_query)
+
+        insert_author_query = """
+                MATCH
+                    (t:Tweet),
+                    (u:User)
+                WHERE t.id=%i AND u.username='%s'
+                CREATE (t)-[:IS_WRITTEN_BY]->(u)
+            """ % (tweet.status_id, tweet.author)
+        tx.run(insert_author_query)
+
+        for hashtag in tweet.hashtags:
+            insert_hashtag_query = """
+                    MATCH
+                        (t:Tweet),
+                        (h:Hashtag)
+                    WHERE t.id=%i AND h.hashtag='%s'
+                    CREATE (h)-[:IS_IN]->(t)
+                """ % (tweet.status_id, hashtag)
+            tx.run(insert_hashtag_query)
+
+        for user in tweet.tagged_persons:
+            insert_linked_user_query = """
+                    MATCH
+                        (t:Tweet),
+                        (u:User)
+                    WHERE t.id=%i AND u.username='%s'
+                    CREATE (u)-[:IS_MENTIONED_IN]->(t)
+                """ % (tweet.status_id, user)
+            tx.run(insert_linked_user_query)
 
 
-def postgres_to_neo4j_connector():
-    logger.info("Fetching latest tweets from database")
-    tweets = ORM.fetch_latest_tweets()
-    logger.info(f"Fetch Done. Fetched tweets: {len(tweets)}")
-    for i in range(0, len(tweets) - 25, 25):
-        logger.info(f"Insert tweets {i} to {i+25}")
-        ORM.write_tweets_to_neo4j(tweets[i: i+25])
-        ids = [tweet.id for tweet in tweets[i: i+25]]
-        Settings.update_last_taken_id(max(ids))
+def runner():
+    logger.info("Start Runner")
+    users = ORM.fetch_latest_users()
+    Neo4J.exec(ORM.write_users_to_neo4j, users=users)
+    max_user_id = max(user.id for user in users)
+    ORM.update_index_in_pg(key="last_taken_twitter_user_id", index=max_user_id)
+    hashtags = ORM.fetch_latest_hashtags()
+    Neo4J.exec(ORM.write_hashtags_to_neo4j, hashtags=hashtags)
+    max_hashtag_id = max(hashtag.id for hashtag in hashtags)
+    ORM.update_index_in_pg(key="last_taken_hashtag_id", index=max_hashtag_id)
+    tweets = ORM.fetch_latest_tweets_ordered_by_id()
+    for tweet in tweets:
+        Neo4J.exec(ORM.write_tweet_to_neo4j, tweet=tweet)
+        ORM.update_index_in_pg(key="last_taken_id", index=tweet.id)
+    logger.info("Done.")
 
 
 if __name__ == "__main__":
-    postgres_to_neo4j_connector()
+    runner()
     print()
