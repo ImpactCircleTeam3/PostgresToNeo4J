@@ -48,7 +48,7 @@ class Settings:
     def get_kafka_consumer_kwargs() -> dict:
         return {
             "bootstrap.servers": os.getenv("KAFKA_CLUSTER_SERVER"),
-            "group.id": uuid.uuid4().hex[:6],
+            "group.id": f"pg2neo-{uuid.uuid4().hex[:6]}",
             'auto.offset.reset': 'earliest',
             'security.protocol': 'SASL_SSL',
             'sasl.mechanisms': 'PLAIN',
@@ -202,8 +202,8 @@ class ORM:
             logger.warning(f"User w. username {user.username} already exists")
 
     @classmethod
-    def write_tweet_to_neo4j(cls, tx: Transaction, tweet: Tweet):
-        logger.info(f"Start writing Tweet w. id {tweet.status_id} to Neo4J")
+    def write_tweet_to_neo4j(cls, tx: Transaction, tweet: Tweet, index: int, max_index: int):
+        logger.info(f"Start writing Tweet {index+1}/{max_index} w. id {tweet.status_id} to Neo4J")
         create_tweet_query = """
                 CREATE (t:Tweet {
                     id: %i,
@@ -267,15 +267,15 @@ def runner():
         ORM.update_index_in_pg(key="last_taken_hashtag_id", index=hashtag.id)
 
     tweets = ORM.fetch_latest_tweets_ordered_by_id()
-    for tweet in tweets:
-        Neo4J.exec(ORM.write_tweet_to_neo4j, tweet=tweet)
+    for i, tweet in enumerate(tweets):
+        Neo4J.exec(ORM.write_tweet_to_neo4j, tweet=tweet, index=i, max_index=len(tweets))
         ORM.update_index_in_pg(key="last_taken_id", index=tweet.id)
     logger.info("Done.")
 
 
 def event_listener():
     consumer = KafkaConnector.get_instance().kafka_connector.consumer
-    consumer.subscribe(["sync"])
+    consumer.subscribe(["pg-sync"])
     while True:
         msg = consumer.poll(timeout=1)
         if msg is None:
